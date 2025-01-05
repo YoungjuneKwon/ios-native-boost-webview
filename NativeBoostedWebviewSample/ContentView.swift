@@ -4,8 +4,10 @@ import SwiftUI
 struct ContentView: View {
     var body: some View {
         VStack {
-            WebViewWrapper(urlString: "custom-http://8090.yjkwon.iscream.0.winm2m.com/mobile/help/faq", cacheListURL: "http://8090.yjkwon.iscream.0.winm2m.com/files/cachelist.json")
-                .edgesIgnoringSafeArea(.all)
+            WebViewWrapper(
+                urlString: "custom-http://8090.yjkwon.iscream.0.winm2m.com/mobile/help/faq",
+                cacheListURL: "http://8090.yjkwon.iscream.0.winm2m.com/files/cachelist.json")
+            .edgesIgnoringSafeArea(.all)
         }
     }
 }
@@ -20,10 +22,39 @@ struct WebViewWrapper: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        let preferences = WKWebpagePreferences()
+        preferences.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = preferences
+
+        // JavaScript 메시지 캡처 설정
+        let userContentController = WKUserContentController()
+        userContentController.add(context.coordinator, name: "consoleHandler")
+        config.userContentController = userContentController
+
         config.setURLSchemeHandler(CustomSchemeHandler(), forURLScheme: "custom-http")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator // UIDelegate 설정
+
+        // JavaScript 콘솔 로깅 스크립트 추가
+        let consoleLogScript = """
+        window.console.log = (function(origLogFunc) {
+            return function(...args) {
+                origLogFunc.apply(window.console, args);
+                window.webkit.messageHandlers.consoleHandler.postMessage(args.join(' '));
+            };
+        })(window.console.log);
+
+        window.console.error = (function(origLogFunc) {
+            return function(...args) {
+                origLogFunc.apply(window.console, args);
+                window.webkit.messageHandlers.consoleHandler.postMessage(args.join(' '));
+            };
+        })(window.console.log);
+        """
+        let script = WKUserScript(source: consoleLogScript, injectionTime: .atDocumentEnd, forMainFrameOnly: false)
+        userContentController.addUserScript(script)
 
         // 캐시 리스트 다운로드 및 파일 사전 로드
         preloadFiles()
@@ -100,9 +131,26 @@ struct WebViewWrapper: UIViewRepresentable {
         return cacheDirectory.appendingPathComponent(url.lastPathComponent)
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             decisionHandler(.allow)
+        }
+
+        // JavaScript alert() 처리
+        func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+            let alert = UIAlertController(title: "Alert", message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                completionHandler()
+            })
+            if let rootVC = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }.first?.rootViewController {
+                rootVC.present(alert, animated: true, completion: nil)
+            }
+        }
+
+        // JavaScript console.log 처리
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "consoleHandler", let messageBody = message.body as? String else { return }
+            print("JavaScript Log: \(messageBody)")
         }
     }
 
@@ -113,17 +161,19 @@ struct WebViewWrapper: UIViewRepresentable {
                 return
             }
 
-            // Preloaded 데이터가 있으면 반환
-            if let data = WebViewWrapper.preloadedData[url.absoluteString.replacingOccurrences(of: "custom-", with: "")] {
-                let response = URLResponse(url: url, mimeType: getMimeType(for: url.absoluteString), expectedContentLength: data.count, textEncodingName: nil)
+            let sanitizedURLString = url.absoluteString.replacingOccurrences(of: "custom-", with: "")
+            let sanitizedURL = URL(string: sanitizedURLString)!
+            if let data = WebViewWrapper.preloadedData[sanitizedURLString] {
+                let mimeType = getMimeType(for: sanitizedURLString)
+                let response = URLResponse(url: url, mimeType: mimeType,
+                                           expectedContentLength: data.count, textEncodingName: "utf-8")
                 urlSchemeTask.didReceive(response)
                 urlSchemeTask.didReceive(data)
                 urlSchemeTask.didFinish()
                 return
             }
-            
-            // Preloaded 데이터가 없으면 네트워크 요청
-            let task = URLSession.shared.dataTask(with: URL(string: url.absoluteString.replacingOccurrences(of: "custom-", with: ""))!) { data, response, error in
+
+            let task = URLSession.shared.dataTask(with: sanitizedURL) { data, response, error in
                 if let error = error {
                     urlSchemeTask.didFailWithError(error)
                     return
@@ -140,9 +190,7 @@ struct WebViewWrapper: UIViewRepresentable {
             task.resume()
         }
 
-        func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
-            // 요청 중단 처리 (필요시 구현)
-        }
+        func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
 
         private func getMimeType(for url: String) -> String {
             if url.hasSuffix(".js") {
